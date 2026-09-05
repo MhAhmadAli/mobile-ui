@@ -26,7 +26,13 @@ struct NativeUIScrollViewRenderer: View {
         // Both drive the same ScrollViewReader, so letting them run together
         // would have two handlers fighting over the same list — the author
         // named a specific child, which is the more specific instruction.
-        let stickBottom = autoScrollIndex == nil
+        //
+        // Gated on the REQUEST rather than the resolved target: an author who
+        // named a child owns the scroll position from that moment, including
+        // the frames before the child exists. Gating on the resolved target
+        // would hand control back to the anchor whenever the index is out of
+        // reach, so a list filling in would sit at the bottom and then jump.
+        let stickBottom = autoScrollRequest == nil
             && node.props.getString("scroll_anchor", default: "") == "bottom"
         let messageSignal = stickBottom ? Self.descendantCount(node) : 0
 
@@ -82,7 +88,7 @@ struct NativeUIScrollViewRenderer: View {
                 // the left edge — the same place Android's `scrollToItem`
                 // puts it.
                 .onAppear { applyAutoScroll(proxy: proxy, anchor: .leading, animated: false) }
-                .onChange(of: autoScrollIndex) { _ in
+                .onChange(of: autoScrollIndex) { _, _ in
                     applyAutoScroll(proxy: proxy, anchor: .leading, animated: true)
                 }
             }
@@ -212,7 +218,7 @@ struct NativeUIScrollViewRenderer: View {
             // matching Android's `scrollToItem`, which puts the item at the
             // start of the list.
             .onAppear { applyAutoScroll(proxy: proxy, anchor: .top, animated: false) }
-            .onChange(of: autoScrollIndex) { _ in
+            .onChange(of: autoScrollIndex) { _, _ in
                 applyAutoScroll(proxy: proxy, anchor: .top, animated: true)
             }
             // The keyboard resizes the scroll viewport in BOTH directions —
@@ -246,29 +252,40 @@ struct NativeUIScrollViewRenderer: View {
         }
     }
 
-    /// Resolves `ScrollView::autoScrollTo($index)` into a concrete child
-    /// index, or `nil` for "no target".
+    /// The author's declared intent: the index passed to
+    /// `ScrollView::autoScrollTo($index)`, or `nil` when they aren't driving
+    /// the scroll position at all (prop absent, or negative).
     ///
-    /// The prop names a DIRECT child of the scroll view. An absent or negative
-    /// value means the author isn't driving the scroll position at all.
+    /// Deliberately independent of the children, so that precedence over
+    /// `scroll-anchor` doesn't flicker while a list fills in.
+    private var autoScrollRequest: Int? {
+        let requested = node.props.getInt("auto_scroll_to", default: -1)
+
+        return requested >= 0 ? requested : nil
+    }
+
+    /// The child to actually bring into view, or `nil` when there is nothing
+    /// to scroll to yet.
     ///
-    /// An index past the end is CLAMPED rather than dropped: PHP publishes the
-    /// index and the children in the same frame, but a list that is still
-    /// filling in (paginated history, a streamed response) can legitimately be
-    /// shorter than the index for a frame or two. Clamping lands on the last
-    /// child now and re-fires as the real target appears; dropping it would
-    /// leave the list parked wherever it was.
+    /// An index past the end is IGNORED, not clamped. Clamping looked like a
+    /// kindness — land on the last child now, correct it later — but it ties
+    /// the scroll to a row that moves whenever the CONTENT does rather than
+    /// when the author's intent does. Removing rows then drags a reader down
+    /// to the new end, and a list streaming in scrolls repeatedly on its way
+    /// to a target it hasn't reached. Ignoring the index keeps the useful
+    /// half: nothing happens until the named child exists, and then the list
+    /// goes there exactly once.
     ///
-    /// Driving `.onChange` off the RESOLVED index (rather than the raw prop)
+    /// Driving `.onChange` off this RESOLVED value (rather than the raw prop)
     /// is what keeps a re-publish from yanking the reader: a screen that
     /// re-renders for an unrelated reason carries the same index and nothing
-    /// fires. It also makes a clamped target re-fire on its own once the list
-    /// grows past it — the resolved value moves even though the prop didn't.
+    /// fires.
     private var autoScrollIndex: Int? {
-        let requested = node.props.getInt("auto_scroll_to", default: -1)
-        guard requested >= 0, !node.children.isEmpty else { return nil }
+        guard let requested = autoScrollRequest,
+              requested < node.children.count
+        else { return nil }
 
-        return min(requested, node.children.count - 1)
+        return requested
     }
 
     /// Brings the `auto_scroll_to` child into view.

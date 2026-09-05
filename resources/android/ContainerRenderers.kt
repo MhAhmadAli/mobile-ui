@@ -338,24 +338,35 @@ private fun totalDescendants(node: NativeUINode): Int {
 }
 
 /**
- * Resolves `ScrollView::autoScrollTo($index)` into a concrete child index, or
- * `-1` for "no target".
+ * The author's declared intent: the index passed to
+ * `ScrollView::autoScrollTo($index)`, or `-1` when they aren't driving the
+ * scroll position at all (prop absent, or negative).
  *
- * The prop names a DIRECT child of the scroll view. An absent or negative
- * value means the author isn't driving the scroll position at all.
+ * Deliberately independent of the children, so that precedence over
+ * `scroll-anchor` doesn't flicker while a list fills in.
+ */
+private fun autoScrollRequest(node: NativeUINode): Int {
+    val requested = node.props.getInt("auto_scroll_to", -1)
+
+    return if (requested < 0) -1 else requested
+}
+
+/**
+ * The child to actually bring into view, or `-1` when there is nothing to
+ * scroll to yet.
  *
- * An index past the end is CLAMPED rather than dropped: PHP publishes the
- * index and the children in the same frame, but a list that is still filling
- * in (paginated history, a streamed response) can legitimately be shorter than
- * the index for a frame or two. Clamping lands on the last child now and
- * re-fires as the real target appears; dropping it would leave the list parked
- * wherever it was.
+ * An index past the end is IGNORED, not clamped. Clamping looked like a
+ * kindness — land on the last child now, correct it later — but it ties the
+ * scroll to a row that moves whenever the CONTENT does rather than when the
+ * author's intent does. Removing rows then drags a reader down to the new end,
+ * and a list streaming in scrolls repeatedly on its way to a target it hasn't
+ * reached. Ignoring the index keeps the useful half: nothing happens until the
+ * named child exists, and then the list goes there exactly once.
  */
 private fun resolveAutoScrollTarget(node: NativeUINode): Int {
-    val requested = node.props.getInt("auto_scroll_to", -1)
-    if (requested < 0 || node.children.isEmpty()) return -1
+    val requested = autoScrollRequest(node)
 
-    return requested.coerceAtMost(node.children.size - 1)
+    return if (requested >= node.children.size) -1 else requested
 }
 
 /**
@@ -422,7 +433,14 @@ object ScrollViewRenderer {
             // Both drive the same LazyListState, so letting them run together
             // would have two effects fighting over the same list — the author
             // named a specific child, which is the more specific instruction.
-            val stickBottom = autoScrollTarget < 0 &&
+            //
+            // Gated on the REQUEST rather than the resolved target: an author
+            // who named a child owns the scroll position from that moment,
+            // including the frames before the child exists. Gating on the
+            // resolved target would hand control back to the anchor whenever
+            // the index is out of reach, so a list filling in would sit at the
+            // bottom and then jump.
+            val stickBottom = autoScrollRequest(node) < 0 &&
                 node.props.getString("scroll_anchor", "") == "bottom"
             val listState = rememberLazyListState()
             val didInitialScroll = remember { mutableStateOf(false) }
