@@ -11,6 +11,15 @@ struct NativeUIScrollViewRenderer: View {
     /// bottom-anchored list opens at the bottom.
     @State private var atBottom: Bool = true
 
+    /// Whether the anchor has pinned the view to the bottom once already, so a
+    /// later re-materialization only re-pins a reader who is still there.
+    @State private var hasPinned: Bool = false
+
+    /// Whether the keyboard is up, from the same show / hide notifications
+    /// that re-pin a bottom-anchored view. While it's down, that view ends
+    /// clear of the home indicator (see `homeIndicatorClearance`).
+    @State private var keyboardShown: Bool = false
+
     var body: some View {
         let horizontal = node.props.getBool("horizontal")
         let showsIndicators = node.props.getBool("shows_indicators", default: true)
@@ -146,6 +155,15 @@ struct NativeUIScrollViewRenderer: View {
                             ))
                     }
                     if stickBottom {
+                        // The view runs under the home indicator, as the
+                        // screen does, while a bottom bar sits above it. With
+                        // the keyboard down, end the content clear of the
+                        // indicator. The keyboard shrinks the view to its own
+                        // top edge, which is clear already, so then this
+                        // collapses, and a page that pads its end for a bottom
+                        // bar pads the same amount either way.
+                        Color.clear
+                            .frame(height: keyboardShown ? 0 : Self.homeIndicatorClearance)
                         Color.clear
                             .frame(height: 1)
                             .id(Self.bottomAnchorID)
@@ -157,10 +175,13 @@ struct NativeUIScrollViewRenderer: View {
                             // reader) — this fires after the anchor has
                             // real geometry, so the pin always lands.
                             .onAppear {
-                                // The anchor being on screen IS the definition
-                                // of "still stuck to the bottom" — the keyboard
-                                // dismiss handler reads this to avoid dragging
-                                // a reader out of history.
+                                // A lazy stack also re-creates the anchor when
+                                // content changes near it, a few rows past the
+                                // viewport. After the first pin, that must not
+                                // pull a reader out of history: only re-pin
+                                // while they're at the bottom.
+                                guard !hasPinned || atBottom else { return }
+                                hasPinned = true
                                 atBottom = true
                                 DispatchQueue.main.async {
                                     proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
@@ -173,6 +194,25 @@ struct NativeUIScrollViewRenderer: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .modifier(ScrollViewBackgroundModifier(node: node))
+            // Whether the reader is at the bottom, from where the scroll view
+            // actually is. The anchor's onAppear / onDisappear can't tell on
+            // their own: a lazy stack keeps the anchor alive a little past the
+            // viewport, so someone a few messages up still read as "at the
+            // bottom" and got pulled down by the next message.
+            //
+            // Only a scroll changes it. New content grows the content first,
+            // which would read as "no longer at the bottom" just before the
+            // follow below asks, and the reader at the bottom would be left
+            // behind.
+            .onScrollGeometryChange(for: BottomProbe.self) { geometry in
+                BottomProbe(
+                    offset: geometry.contentOffset.y,
+                    atBottom: geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+                )
+            } action: { old, new in
+                guard stickBottom, old.offset != new.offset else { return }
+                atBottom = new.atBottom
+            }
             // Hand this scroll view's proxy to its subtree, so a text input
             // anywhere inside can bring ITSELF above the keyboard when it
             // takes focus (`NativeUITextInputCore`). `ScrollViewReader`
@@ -195,9 +235,24 @@ struct NativeUIScrollViewRenderer: View {
                 }
             }
             .onChange(of: messageSignal) { _ in
-                guard stickBottom else { return }
-                withAnimation(.easeOut(duration: 0.25)) {
-                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                // Follow new content only while the reader is at the bottom
+                // (see the scroll geometry check above). Someone scrolled back
+                // into history stays where they are:
+                // a message arriving, a reaction landing on an old message,
+                // or a page of older messages loading above must not yank
+                // them down to the latest one.
+                guard stickBottom, atBottom else { return }
+                // Lazy rows below the viewport only have estimated heights
+                // until they're on screen, so the animated scroll can stop
+                // short of the real end. Once it has brought them in and they
+                // are measured, a second scroll without animation lands on it.
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                    }
                 }
             }
             // The keyboard resizes the scroll viewport in BOTH directions —
@@ -215,6 +270,7 @@ struct NativeUIScrollViewRenderer: View {
             .onReceive(NotificationCenter.default.publisher(
                 for: UIResponder.keyboardWillShowNotification)
             ) { note in
+                setKeyboardShown(true, stickBottom: stickBottom, note: note)
                 repinToBottom(stickBottom: stickBottom, proxy: proxy, note: note)
             }
             .onReceive(NotificationCenter.default.publisher(
@@ -225,6 +281,7 @@ struct NativeUIScrollViewRenderer: View {
                 // list toward older messages is itself how you dismiss the
                 // keyboard — re-pinning unconditionally would yank the reader
                 // straight back down and undo the scroll that dismissed it.
+                setKeyboardShown(false, stickBottom: stickBottom, note: note)
                 guard atBottom else { return }
                 repinToBottom(stickBottom: stickBottom, proxy: proxy, note: note)
             }
@@ -248,6 +305,26 @@ struct NativeUIScrollViewRenderer: View {
         }
     }
 
+    /// Grows or collapses the home indicator clearance with the keyboard's own
+    /// animation, so the end of the view moves with it.
+    private func setKeyboardShown(_ shown: Bool, stickBottom: Bool, note: Notification) {
+        guard stickBottom, keyboardShown != shown else { return }
+
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+
+        withAnimation(.easeOut(duration: duration)) {
+            keyboardShown = shown
+        }
+    }
+
+    /// The window's bottom safe-area inset: the home indicator, or nothing on
+    /// a device with a home button.
+    private static var homeIndicatorClearance: CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.windows.first?.safeAreaInsets.bottom ?? 0
+    }
+
     private static let bottomAnchorID = "nphp.scroll.bottom.anchor"
 
     /// Recursive descendant count — a content signal that changes whenever a
@@ -260,6 +337,13 @@ struct NativeUIScrollViewRenderer: View {
         }
         return count
     }
+}
+
+/// Where a bottom-anchored scroll view is: its offset, and whether that's at
+/// the bottom of its content.
+private struct BottomProbe: Equatable {
+    let offset: CGFloat
+    let atBottom: Bool
 }
 
 /// Applies a minimum height only when there is one, so children that didn't
