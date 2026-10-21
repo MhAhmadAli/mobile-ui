@@ -374,21 +374,25 @@ private fun resolveAutoScrollTarget(node: NativeUINode): Int {
  * Keyed on the RESOLVED index, so the scroll fires when the author's intent
  * actually changes — not on every re-publish. A screen that re-renders for an
  * unrelated reason (a tick, a toggle elsewhere) carries the same index and
- * leaves a reader who has scrolled away exactly where they were. It also means
- * a clamped target re-fires on its own once the list grows past it: the
- * resolved value moves even though the prop didn't.
+ * leaves a reader who has scrolled away exactly where they were.
+ *
+ * Armed when the author sets or changes the request and disarmed once the list
+ * has gone there, so content that takes the target out of range and brings it
+ * back (a refresh, a filter cleared) doesn't move the reader again.
  *
  * First application jumps, later ones animate — matching `scroll-anchor`:
  * a screen that opens already scrolled shouldn't visibly fly down from the
  * top, but a later move is a state change the user should see happen.
  */
 @Composable
-private fun AutoScrollToEffect(targetIndex: Int, listState: LazyListState) {
+private fun AutoScrollToEffect(request: Int, targetIndex: Int, listState: LazyListState) {
     val didInitialScroll = remember { mutableStateOf(false) }
+    val armed = remember(request) { mutableStateOf(request >= 0) }
 
-    LaunchedEffect(targetIndex) {
-        if (targetIndex < 0) return@LaunchedEffect
+    LaunchedEffect(request, targetIndex) {
+        if (!armed.value || targetIndex < 0) return@LaunchedEffect
 
+        armed.value = false
         if (!didInitialScroll.value) {
             didInitialScroll.value = true
             listState.scrollToItem(targetIndex)
@@ -409,7 +413,7 @@ object ScrollViewRenderer {
         if (horizontal) {
             val rowState = rememberLazyListState()
 
-            AutoScrollToEffect(autoScrollTarget, rowState)
+            AutoScrollToEffect(autoScrollRequest(node), autoScrollTarget, rowState)
 
             LazyRow(modifier = modifier, state = rowState) {
                 items(node.children, key = { it.id }) { child ->
@@ -464,7 +468,7 @@ object ScrollViewRenderer {
                 }
             }
 
-            AutoScrollToEffect(autoScrollTarget, listState)
+            AutoScrollToEffect(autoScrollRequest(node), autoScrollTarget, listState)
 
             // A `fill` / `h-full` DIRECT child asked to be at least as tall as
             // the VIEWPORT — the "short screen centred, still scrolls when the

@@ -17,6 +17,13 @@ struct NativeUIScrollViewRenderer: View {
     /// initiate is visible rather than teleporting the content.
     @State private var didInitialAutoScroll: Bool = false
 
+    /// The `auto_scroll_to` request this view last saw, and whether the list
+    /// still owes it a scroll. Armed when the author sets or changes the
+    /// request, disarmed once the list has gone there, so content that takes
+    /// the child out of range and brings it back doesn't move the reader again.
+    @State private var lastAutoScrollRequest: Int?
+    @State private var autoScrollArmed: Bool = false
+
     /// Whether the anchor has pinned the view to the bottom once already, so a
     /// later re-materialization only re-pins a reader who is still there.
     @State private var hasPinned: Bool = false
@@ -241,7 +248,10 @@ struct NativeUIScrollViewRenderer: View {
                     atBottom: geometry.visibleRect.maxY >= geometry.contentSize.height - 24
                 )
             } action: { old, new in
-                guard stickBottom, old.offset != new.offset else { return }
+                // Tracked even while `auto_scroll_to` owns the list, so that
+                // when the request goes away the anchor knows whether the
+                // reader is at the bottom and follows new content from there.
+                guard old.offset != new.offset else { return }
                 atBottom = new.atBottom
             }
             // Hand this scroll view's proxy to its subtree, so a text input
@@ -372,8 +382,15 @@ struct NativeUIScrollViewRenderer: View {
     /// application always jumps regardless — an `.onChange` can be the first
     /// thing to fire when the prop arrives after the initial layout.
     private func applyAutoScroll(proxy: ScrollViewProxy, anchor: UnitPoint, animated: Bool) {
-        guard let index = autoScrollIndex else { return }
+        let request = autoScrollRequest
+        if request != lastAutoScrollRequest {
+            lastAutoScrollRequest = request
+            autoScrollArmed = request != nil
+        }
 
+        guard autoScrollArmed, let index = autoScrollIndex else { return }
+
+        autoScrollArmed = false
         let targetID = node.children[index].id
         let shouldAnimate = animated && didInitialAutoScroll
         didInitialAutoScroll = true
